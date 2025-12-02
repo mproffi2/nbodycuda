@@ -1,20 +1,29 @@
-# Makefile for N-Body Simulation (CPU + GPU)
+# Makefile for N-Body Simulation (CPU + optional GPU)
 
-NVCC        = nvcc
-CXX         = g++
-CXXFLAGS    = -O3 -std=c++17
-NVCCFLAGS   = -O3 -std=c++17 -arch=sm_61
+# Detect if nbody.cu exists; if not, use nbody.cpp
+ifeq ($(wildcard nbody.cu),)
+  SRC = nbody.cpp
+  USE_NVCC = false
+else
+  SRC = nbody.cu
+  USE_NVCC = true
+endif
 
-TARGET      = nbody
-SRC         = nbody.cu
+CXX      = g++
+CXXFLAGS = -O3 -std=c++17
+NVCC     = nvcc
+NVCCFLAGS= -O3 -std=c++17 -arch=sm_61
+
+TARGET   = nbody
 
 all: $(TARGET)
 
-$(TARGET): $(SRC)
+$(TARGET):
+ifeq ($(USE_NVCC),true)
 	$(NVCC) $(NVCCFLAGS) -o $(TARGET) $(SRC)
-
-cpu: $(SRC)
-	$(CXX) $(CXXFLAGS) -o $(TARGET)_cpu $(SRC)
+else
+	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SRC)
+endif
 
 clean:
-	rm -f $(TARGET) $(TARGET)_cpu *.o
+	rm -f $(TARGET) *.o
