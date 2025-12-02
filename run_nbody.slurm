@@ -17,4 +17,5 @@ BLOCK_SIZE=${5:-128}
 
 module load cuda/12.4
 
-./nbody $NUM_PARTICLES $DT $NUM_STEPS $PRINT_EVERY $BLOCK_SIZE
+# Add GPU flag (the 6th argument)
+./nbody $NUM_PARTICLES $DT $NUM_STEPS $PRINT_EVERY $BLOCK_SIZE --gpu
