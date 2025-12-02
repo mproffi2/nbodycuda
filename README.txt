@@ -7,3 +7,7 @@
    sbatch run_nbody.slurm 1000 0.01 50 10 128
 4. Check the output log file for simulation results:
    nbody_output_<jobid>.log
+
+5. Running on CPU:
+   Example:
+   ./nbody 10000 0.01 10 5

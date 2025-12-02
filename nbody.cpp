@@ -1,12 +1,7 @@
-#include <iostream> 
+#include <iostream>
 #include <fstream>
 #include <random>
 #include <cmath>
-#include <vector>
-#include <chrono>
-#ifdef __CUDACC__
-#include <cuda_runtime.h>
-#endif
 
 double G = 6.674*std::pow(10,-11);
 //double G = 1;
@@ -182,204 +177,21 @@ void load_from_file(simulation& s, std::string filename) {
     throw "kaboom";
 }
 
-// softening for GPU kernel & CPU use
-static const double SOFTENING = 1e-9;
-
-// CPU-only helper that times the main loop
-double run_cpu(simulation &s, double dt, size_t nbstep, size_t printevery) {
-  auto tstart = std::chrono::high_resolution_clock::now();
-
-  for (size_t step = 0; step< nbstep; step++) {
-    if (step %printevery == 0)
-      dump_state(s);
-  
-    reset_force(s);
-    for (size_t i=0; i<s.nbpart; ++i)
-      for (size_t j=0; j<s.nbpart; ++j)
-    if (i != j)
-      update_force(s, i, j);
-
-    for (size_t i=0; i<s.nbpart; ++i) {
-      apply_force(s, i, dt);
-      update_position(s, i, dt);
-    }
-  }
-
-  auto tend = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double> diff = tend - tstart;
-  return diff.count();
-}
-
-#ifdef __CUDACC__
-// CUDA kernels 
-// compute forces: thread i computes net force on particle i
-__global__ void compute_forces_gpu(size_t n,
-                                   const double* mass,
-                                   const double* x,
-                                   const double* y,
-                                   const double* z,
-                                   double* fx,
-                                   double* fy,
-                                   double* fz) {
-  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
-
-  double fxi = 0.0;
-  double fyi = 0.0;
-  double fzi = 0.0;
-
-  double xi = x[i];
-  double yi = y[i];
-  double zi = z[i];
-  double mi = mass[i];
-
-  for (size_t j = 0; j < n; ++j) {
-    if (j == i) continue;
-    double dx = xi - x[j];
-    double dy = yi - y[j];
-    double dz = zi - z[j];
-    double dist2 = dx*dx + dy*dy + dz*dz + SOFTENING;
-    double dist = sqrt(dist2);
-    // magnitude of force
-    double F = G * mi * mass[j] / dist2;
-    // normalize direction safely
-    double invnorm = 1.0 / (dist + 1e-30);
-    double nx = dx * invnorm;
-    double ny = dy * invnorm;
-    double nz = dz * invnorm;
-    fxi += nx * F;
-    fyi += ny * F;
-    fzi += nz * F;
-  }
-
-  fx[i] = fxi;
-  fy[i] = fyi;
-  fz[i] = fzi;
-}
-
-// integrate kernel to update velocities and positions
-__global__ void integrate_gpu(size_t n, double dt,
-                              const double* mass,
-                              double* x, double* y, double* z,
-                              double* vx, double* vy, double* vz,
-                              const double* fx, const double* fy, const double* fz) {
-  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
-  double ax = fx[i] / mass[i];
-  double ay = fy[i] / mass[i];
-  double az = fz[i] / mass[i];
-
-  vx[i] += ax * dt;
-  vy[i] += ay * dt;
-  vz[i] += az * dt;
-
-  x[i] += vx[i] * dt;
-  y[i] += vy[i] * dt;
-  z[i] += vz[i] * dt;
-}
-
-// helper to run GPU version
-double run_gpu(simulation &s, double dt, size_t nbstep, size_t printevery, int blocksize) {
-  size_t n = s.nbpart;
-  size_t bytes = n * sizeof(double);
-
-  // device pointers
-  double *d_mass=nullptr, *d_x=nullptr, *d_y=nullptr, *d_z=nullptr;
-  double *d_vx=nullptr, *d_vy=nullptr, *d_vz=nullptr;
-  double *d_fx=nullptr, *d_fy=nullptr, *d_fz=nullptr;
-
-  cudaMalloc(&d_mass, bytes);
-  cudaMalloc(&d_x, bytes);
-  cudaMalloc(&d_y, bytes);
-  cudaMalloc(&d_z, bytes);
-  cudaMalloc(&d_vx, bytes);
-  cudaMalloc(&d_vy, bytes);
-  cudaMalloc(&d_vz, bytes);
-  cudaMalloc(&d_fx, bytes);
-  cudaMalloc(&d_fy, bytes);
-  cudaMalloc(&d_fz, bytes);
-
-  // copy initial data to device
-  cudaMemcpy(d_mass, s.mass.data(), bytes, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_x, s.x.data(), bytes, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_y, s.y.data(), bytes, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_z, s.z.data(), bytes, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_vx, s.vx.data(), bytes, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_vy, s.vy.data(), bytes, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_vz, s.vz.data(), bytes, cudaMemcpyHostToDevice);
-
-  // zero forces
-  cudaMemset(d_fx, 0, bytes);
-  cudaMemset(d_fy, 0, bytes);
-  cudaMemset(d_fz, 0, bytes);
-
-  int threads = blocksize > 0 ? blocksize : 128;
-  int blocks = (int)((n + threads - 1) / threads);
-
-  auto tstart = std::chrono::high_resolution_clock::now();
-
-  for (size_t step = 0; step < nbstep; ++step) {
-    // compute forces
-    cudaMemset(d_fx, 0, bytes);
-    cudaMemset(d_fy, 0, bytes);
-    cudaMemset(d_fz, 0, bytes);
-
-    compute_forces_gpu<<<blocks, threads>>>(n, d_mass, d_x, d_y, d_z, d_fx, d_fy, d_fz);
-    cudaDeviceSynchronize();
-
-    // integrate
-    integrate_gpu<<<blocks, threads>>>(n, dt, d_mass, d_x, d_y, d_z, d_vx, d_vy, d_vz, d_fx, d_fy, d_fz);
-    cudaDeviceSynchronize();
-
-    // copy back and print at intervals
-    if (step % printevery == 0) {
-      cudaMemcpy(s.x.data(), d_x, bytes, cudaMemcpyDeviceToHost);
-      cudaMemcpy(s.y.data(), d_y, bytes, cudaMemcpyDeviceToHost);
-      cudaMemcpy(s.z.data(), d_z, bytes, cudaMemcpyDeviceToHost);
-      cudaMemcpy(s.vx.data(), d_vx, bytes, cudaMemcpyDeviceToHost);
-      cudaMemcpy(s.vy.data(), d_vy, bytes, cudaMemcpyDeviceToHost);
-      cudaMemcpy(s.vz.data(), d_vz, bytes, cudaMemcpyDeviceToHost);
-      cudaMemcpy(s.fx.data(), d_fx, bytes, cudaMemcpyDeviceToHost);
-      cudaMemcpy(s.fy.data(), d_fy, bytes, cudaMemcpyDeviceToHost);
-      cudaMemcpy(s.fz.data(), d_fz, bytes, cudaMemcpyDeviceToHost);
-      dump_state(s);
-    }
-  }
-
-  auto tend = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double> diff = tend - tstart;
-
-  // free
-  cudaFree(d_mass); cudaFree(d_x); cudaFree(d_y); cudaFree(d_z);
-  cudaFree(d_vx); cudaFree(d_vy); cudaFree(d_vz);
-  cudaFree(d_fx); cudaFree(d_fy); cudaFree(d_fz);
-
-  return diff.count();
-}
-#endif // __CUDACC__
-
 int main(int argc, char* argv[]) {
-  if (argc != 5 && argc != 6) {
+  if (argc != 5) {
     std::cerr
-      <<"usage: "<<argv[0]<<" <input> <dt> <nbstep> <printevery> [--gpu]"<<"\n"
+      <<"usage: "<<argv[0]<<" <input> <dt> <nbstep> <printevery>"<<"\n"
       <<"input can be:"<<"\n"
       <<"a number (random initialization)"<<"\n"
       <<"planet (initialize with solar system)"<<"\n"
-      <<"a filename (load from file in singleline tsv)"<<"\n"
-      <<"optional 5th argument: --gpu to run on GPU (requires nvcc build and CUDA-capable device)\n";
+      <<"a filename (load from file in singleline tsv)"<<"\n";
     return -1;
   }
   
   double dt = std::atof(argv[2]); //in seconds
   size_t nbstep = std::atol(argv[3]);
   size_t printevery = std::atol(argv[4]);
-
-  // detect optional GPU flag
-  bool useGPU = false;
-  if (argc == 6) {
-    std::string flag = argv[5];
-    if (flag == std::string("--gpu")) useGPU = true;
-  }
+  
   
   simulation s(1);
 
@@ -392,39 +204,31 @@ int main(int argc, char* argv[]) {
     } else {
       std::string inputparam = argv[1];
       if (inputparam == "planet") {
-    init_solar(s);
+	init_solar(s);
       } else{
-    load_from_file(s, inputparam);
+	load_from_file(s, inputparam);
       }
     }    
   }
 
-  int blocksize = 128;
+  
+  for (size_t step = 0; step< nbstep; step++) {
+    if (step %printevery == 0)
+      dump_state(s);
+  
+    reset_force(s);
+    for (size_t i=0; i<s.nbpart; ++i)
+      for (size_t j=0; j<s.nbpart; ++j)
+	if (i != j)
+	  update_force(s, i, j);
 
-  // run either CPU or GPU and time both
-#ifdef __CUDACC__
-  if (useGPU) {
-    // run GPU path 
-    double elapsed = run_gpu(s, dt, nbstep, printevery, blocksize);
-    std::cerr << "runtime(GPU): " << elapsed << " s\n";
-    return 0;
-  } else {
-    double elapsed = run_cpu(s, dt, nbstep, printevery);
-    std::cerr << "runtime(CPU): " << elapsed << " s\n";
-    return 0;
+    for (size_t i=0; i<s.nbpart; ++i) {
+      apply_force(s, i, dt);
+      update_position(s, i, dt);
+    }
   }
-#else
-  // if not compiled with nvcc, only CPU is available
-  if (useGPU) {
-    std::cerr << "GPU requested but this binary was not built with nvcc/CUDA support.\n"
-              << "Rebuild with nvcc to enable GPU (e.g., nvcc -O3 -arch=sm_61 nbody.cpp -o nbody_cuda).\n";
-    return -1;
-  }
-  double elapsed = run_cpu(s, dt, nbstep, printevery);
-  std::cerr << "runtime(CPU): " << elapsed << " s\n";
-  return 0;
-#endif
- 
+  
+  //dump_state(s);  
 
 
   return 0;
