@@ -6,7 +6,7 @@
 #include <chrono>
 #include <cuda_runtime.h>
 
-double G = 6.674*std::pow(10,-11);
+__constant__ double G = 6.67430e-11;
 //double G = 1;
 
 struct simulation {
